@@ -14,7 +14,7 @@ except Exception:
 from bs4 import BeautifulSoup, Comment
 
 # ---------------- CONFIG ----------------
-URL = "https://fbref.com/en/players/363b99a4/Pernille-Harder"  # change this to any player page
+URL = "https://fbref.com/en/players/dea698d9/Cristiano-Ronaldo"  # change this to any player page
 THIS_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(THIS_DIR, "..", "data")
 OUTPUT_CSV = os.path.join(DATA_DIR, "output.csv")
@@ -43,23 +43,39 @@ def try_parse_date(s):
     if not s:
         return None
     s = s.strip()
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y"):
+    # normalize few variants
+    s = s.replace("\xa0", " ")
+    # common formats
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y", "%B %Y", "%b %Y"):
         try:
             return datetime.strptime(s, fmt).date()
         except Exception:
             pass
-    m = re.search(r'([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})', s)
+    # month year like "June 2027"
+    m = re.search(r'([A-Za-z]+)\s+(\d{4})', s)
     if m:
         try:
-            return datetime.strptime(m.group(1), "%B %d, %Y").date()
+            return datetime.strptime(m.group(0), "%B %Y").date()
         except Exception:
-            pass
+            try:
+                return datetime.strptime(m.group(0), "%b %Y").date()
+            except Exception:
+                pass
+    # yyyy-mm-dd anywhere
     m2 = re.search(r'(\d{4}-\d{2}-\d{2})', s)
     if m2:
         try:
             return datetime.strptime(m2.group(1), "%Y-%m-%d").date()
         except Exception:
             pass
+    # dd Month yyyy or similar inside text
+    m3 = re.search(r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', s)
+    if m3:
+        for fmt in ("%d %B %Y", "%d %b %Y"):
+            try:
+                return datetime.strptime(m3.group(1), fmt).date()
+            except Exception:
+                pass
     return None
 
 def compute_age(birth_date):
@@ -115,7 +131,6 @@ def fetch_html_cloudscraper(url, attempts=3):
                         return r2.text
                 except Exception as e:
                     print("[cloudscraper] root visit failed:", e)
-            # small backoff
             time.sleep(0.5 * attempt)
         except Exception as e:
             print("[cloudscraper] attempt exception:", e)
@@ -132,7 +147,6 @@ def fetch_html_cloudscraper(url, attempts=3):
 
 # ---------- Selenium fallback (fixed init, minimal wait) ----------
 def fetch_html_selenium(url, headless=False, wait_seconds=4):
-    # imports here to avoid heavy dependency until needed
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
@@ -142,7 +156,6 @@ def fetch_html_selenium(url, headless=False, wait_seconds=4):
     opts = Options()
     if headless:
         opts.add_argument("--headless=new")
-    # small set of helpful flags
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -156,7 +169,6 @@ def fetch_html_selenium(url, headless=False, wait_seconds=4):
 
     try:
         driver.get(url)
-        # short wait — increase if you see incomplete HTML
         time.sleep(wait_seconds)
         html = driver.page_source
         save_debug(html)
@@ -228,10 +240,10 @@ def parse_json_ld(soup):
     return None
 
 def extract_label_values(fragment):
-    LABEL_RE = re.compile(r'(born|birth|weight|height|nationalit|foot|position|place of birth)', re.I)
+    LABEL_RE = re.compile(r'(born|birth|weight|height|nationalit|foot|position|place of birth|contract|debut|born:)', re.I)
     HEIGHT_RE = re.compile(r'(\d{2,3}\s?cm|\d\.\d+\s?m)', re.I)
     WEIGHT_RE = re.compile(r'(\d{2,3}\s?kg)', re.I)
-    DOB_RE = re.compile(r'(\d{1,2}\s+\w+\s+\d{4}|\d{4}-\d{2}-\d{2})')
+    DOB_RE = re.compile(r'(\d{1,2}\s+\w+\s+\d{4}|\d{4}-\d{2}-\d{2}|\w+\s+\d{4})')
     text = fragment.get_text(separator="\n", strip=True)
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     out = {}
@@ -260,6 +272,11 @@ def extract_label_values(fragment):
             out["position_raw"] = val
         if "foot" in label:
             out["preferred_foot_raw"] = val
+        if "contract" in label or "expires" in ln.lower():
+            # capture the portion after label or the whole line
+            out["contract_raw"] = val if val else ln
+        if "debut" in label or "debut" in ln.lower():
+            out["debut_raw"] = val if val else ln
     if "height_raw" not in out:
         hm = HEIGHT_RE.search(text)
         if hm:
@@ -294,6 +311,52 @@ def find_meta_fragment(soup):
             return frag, "meta_in_comment"
     return None, None
 
+# ---- new: extract contract and debut helpers ----
+def extract_contract_from_fragment(fragment):
+    # try to find phrases like "Expires June 2027" or "Contract until <date>"
+    txt = fragment.get_text(" ", strip=True)
+    # common patterns
+    m = re.search(r'Expires\s+([A-Za-z0-9,\s\-]+?)(?:\.|Via|$)', txt, re.I)
+    if m:
+        candidate = m.group(1).strip()
+        d = try_parse_date(candidate)
+        return (d.isoformat() if d else candidate)
+    m2 = re.search(r'Contract(?:\s+until|\s*[:])\s*([A-Za-z0-9,\s\-]+?)(?:\.|$)', txt, re.I)
+    if m2:
+        candidate = m2.group(1).strip()
+        d = try_parse_date(candidate)
+        return (d.isoformat() if d else candidate)
+    # maybe line contains "Expires <month year>"
+    m3 = re.search(r'(Expires\s+[A-Za-z]+\s+\d{4})', txt, re.I)
+    if m3:
+        candidate = m3.group(1).replace("Expires", "").strip()
+        d = try_parse_date(candidate)
+        return (d.isoformat() if d else candidate)
+    return None
+
+def extract_debut_from_fragment(fragment):
+    # look for lines containing debut or "Senior debut" etc.
+    txt = fragment.get_text("\n", strip=True)
+    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+    for ln in lines:
+        if re.search(r'\bdebut\b', ln, re.I):
+            # try to extract a date from the line
+            d = try_parse_date(ln)
+            if d:
+                return d.isoformat()
+            # otherwise return cleaned snippet
+            # remove leading label like "Debut:" or "Senior debut:"
+            ln2 = re.sub(r'^[A-Za-z ]*debut[:\s\-]*', '', ln, flags=re.I).strip()
+            return ln2
+    # try a looser search in whole fragment
+    m = re.search(r'(Debut[:\s]*[A-Za-z0-9,\s\-]+)', txt, re.I)
+    if m:
+        candidate = m.group(1).split(":",1)[-1].strip()
+        d = try_parse_date(candidate)
+        return (d.isoformat() if d else candidate)
+    return None
+
+# ---------- main extraction combining everything ----------
 def extract_player(soup, meta_fragment):
     info = {
         "name": "Not Found",
@@ -304,7 +367,9 @@ def extract_player(soup, meta_fragment):
         "nationality": "Not Found",
         "position": "Not Found",
         "preferred_foot": "Not Found",
-        "birthplace": "Not Found"
+        "birthplace": "Not Found",
+        "debut": "Not Found",            # new
+        "contract_until": "Not Found"    # new
     }
 
     h1 = soup.find("h1")
@@ -332,8 +397,10 @@ def extract_player(soup, meta_fragment):
         if jl.get("roleName"):
             info["position"] = jl.get("roleName")
 
+    # try parse meta fragment / comment fragment
     if meta_fragment is not None:
         candidates = extract_label_values(meta_fragment)
+        # basic fields
         if candidates.get("dob_raw") and info["dob"] == "Not Found":
             dr = candidates["dob_raw"].strip()
             if dr and dr != ":":
@@ -360,6 +427,47 @@ def extract_player(soup, meta_fragment):
         if candidates.get("nationality_raw") and info["nationality"] == "Not Found":
             info["nationality"] = candidates["nationality_raw"]
 
+        # NEW: contract and debut attempts from fragment
+        cval = None
+        if candidates.get("contract_raw"):
+            cval = candidates.get("contract_raw")
+        if not cval:
+            cval = extract_contract_from_fragment(meta_fragment)
+        if cval:
+            info["contract_until"] = cval if isinstance(cval, str) else str(cval)
+
+        dval = None
+        if candidates.get("debut_raw"):
+            dval = candidates.get("debut_raw")
+        if not dval:
+            dval = extract_debut_from_fragment(meta_fragment)
+        if dval:
+            info["debut"] = dval if isinstance(dval, str) else str(dval)
+
+    # fallback scan of whole page text (if missing)
+    whole_text = soup.get_text(" ", strip=True)
+    if info["contract_until"] == "Not Found":
+        # patterns across whole page
+        m = re.search(r'Expires\s+([A-Za-z0-9,\s\-]+?)(?:\.|Via|$)', whole_text, re.I)
+        if m:
+            candidate = m.group(1).strip()
+            d = try_parse_date(candidate)
+            info["contract_until"] = d.isoformat() if d else candidate
+        else:
+            m2 = re.search(r'Contract(?:\s+until|\s*[:])\s*([A-Za-z0-9,\s\-]+?)(?:\.|$)', whole_text, re.I)
+            if m2:
+                candidate = m2.group(1).strip()
+                d = try_parse_date(candidate)
+                info["contract_until"] = d.isoformat() if d else candidate
+
+    if info["debut"] == "Not Found":
+        m = re.search(r'\bDebut[:\s\-]*([A-Za-z0-9,\s\-]+)', whole_text, re.I)
+        if m:
+            candidate = m.group(1).strip()
+            d = try_parse_date(candidate)
+            info["debut"] = d.isoformat() if d else candidate
+
+    # other existing fallbacks for height, weight, nationality, birthplace
     if info["height"] == "Not Found":
         h = soup.find("span", {"itemprop":"height"})
         if h:
@@ -426,7 +534,7 @@ def normalize_quant_val(q):
 
 def save_csv(row):
     ensure_data_dir()
-    header = ["name","dob","age","height","weight","nationality","position","preferred_foot","birthplace","source_url"]
+    header = ["name","dob","age","height","weight","nationality","position","preferred_foot","birthplace","debut","contract_until","source_url"]
     write_header = not os.path.exists(OUTPUT_CSV)
     with open(OUTPUT_CSV, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=header)
@@ -451,7 +559,6 @@ def main():
         except Exception as e:
             print("cloudscraper failed:", e)
             print("Falling back to Selenium (real browser). This will open Chrome on your machine.")
-            # headless=False helps with Cloudflare visual challenges — set True later if needed
             html = fetch_html_selenium(URL, headless=False, wait_seconds=4)
 
     soup = BeautifulSoup(html, "lxml")
