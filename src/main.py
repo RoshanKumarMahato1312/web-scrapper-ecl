@@ -14,7 +14,7 @@ except Exception:
 from bs4 import BeautifulSoup, Comment
 
 # ---------------- CONFIG ----------------
-URL = "https://fbref.com/en/players/dea698d9/Cristiano-Ronaldo"  # change this to any player page
+URL = "https://fbref.com/en/players/b66315ae/Gabriel-Jesus"  # change this to any player page
 THIS_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(THIS_DIR, "..", "data")
 OUTPUT_CSV = os.path.join(DATA_DIR, "output.csv")
